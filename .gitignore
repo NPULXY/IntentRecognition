@@ -1,0 +1,19 @@
+# 数据文件（太大，不纳入版本控制）
+Dataset/
+
+# 模型与日志
+checkpoints/
+logs/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/

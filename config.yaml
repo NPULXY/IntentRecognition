@@ -1,0 +1,65 @@
+# ============================================================
+# 意图识别模型 —— Conv2D + Transformer 混合模型配置 (v3)
+# 保留 v1 核心架构，仅 phi 改用 cos/sin 双通道
+# ============================================================
+
+# 数据
+data:
+  data_dir: "./Dataset"
+  x_real_file: "X_real.csv"
+  x_recurrence_file: "X_recurrence.csv"
+  y_file: "Y.csv"
+  max_targets: 4
+  time_steps: 10
+  feature_dim: 6
+
+# 数据集划分
+split:
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  random_seed: 42
+
+# 标签变换 (仅 phi 用 cos/sin，dist 保持原值)
+label_transform:
+  dist_log: false
+  phi_cos_sin: true
+
+# 模型 (与 v1 相近，仅 phi 头输出 2 通道)
+model:
+  conv_channels: [32, 64, 128]
+  conv_kernel: 3
+  conv_padding: 1
+  pool_kernel: 2
+
+  d_model: 256
+  nhead: 8
+  num_encoder_layers: 3
+  dim_feedforward: 512
+  dropout: 0.1
+
+  hidden_dim: 256
+
+# 损失权重
+loss:
+  n_weight: 1.0
+  dist_weight: 1.0
+  phi_weight: 1.0
+
+# 训练
+training:
+  batch_size: 64
+  num_epochs: 150
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  lr_scheduler_patience: 15
+  lr_scheduler_factor: 0.5
+  early_stopping_patience: 30
+  num_workers: 0
+
+# 日志与保存
+logging:
+  log_dir: "./logs"
+  model_save_dir: "./checkpoints"
+  best_model_name: "best_model.pt"
+  log_interval: 50
