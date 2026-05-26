@@ -41,14 +41,14 @@ def pad_step(sample: np.ndarray, max_len: int) -> np.ndarray:
 
 def parse_csv_to_tensor(filepath: str, max_step_features: int):
     """
-    解析单个 CSV 文件为三维张量 (样本数, 时间步, max_step_features)。
+    解析单个 CSV 文件为三维张量，并计算每步的"最近-最远夹角"特征。
 
     新数据集每步包含: N×6 状态 + N 距离 + C(N,2) 夹角。
-    N=2→15, N=3→24, N=4→34。pad 至 34。
+    追加一列: 该时间步最近与最远目标的夹角（预计算 argmin/argmax）。
 
     参数:
         filepath: CSV 文件路径
-        max_step_features: 单步最大特征数 (34)
+        max_step_features: 单步最大特征数 (35)
 
     返回:
         numpy 数组, shape (num_samples, 10, max_step_features)
@@ -57,7 +57,7 @@ def parse_csv_to_tensor(filepath: str, max_step_features: int):
     masks = []
 
     with open(filepath, "r", encoding="utf-8") as f:
-        header = f.readline()  # 跳过列名行
+        header = f.readline()
         for line in f:
             line = line.strip()
             if not line:
@@ -67,19 +67,89 @@ def parse_csv_to_tensor(filepath: str, max_step_features: int):
             time_steps_mask = []
 
             for step in raw:
-                padded = pad_step(np.array(step, dtype=np.float32), max_step_features)
+                step_arr = np.array(step, dtype=np.float32)
+                # 追加"最近-最远夹角"特征
+                step_with_nf = _append_nearest_farthest_angle(step_arr)
+                padded = pad_step(step_with_nf, max_step_features)
                 time_steps_data.append(padded)
 
-                # 构建有效性掩码（非零位置为真实特征）
                 m = (padded != 0).astype(np.float32)
                 time_steps_mask.append(m)
 
-            samples.append(np.stack(time_steps_data, axis=0))   # (10, max_step_features)
-            masks.append(np.stack(time_steps_mask, axis=0))      # (10, max_step_features)
+            samples.append(np.stack(time_steps_data, axis=0))
+            masks.append(np.stack(time_steps_mask, axis=0))
 
-    data = np.stack(samples, axis=0)  # (num_samples, 10, max_step_features)
-    masks = np.stack(masks, axis=0)   # (num_samples, 10, max_step_features)
+    data = np.stack(samples, axis=0)
+    masks = np.stack(masks, axis=0)
     return data, masks
+
+
+def _get_pairwise_angle_index(i: int, j: int, n_targets: int) -> int:
+    """
+    将目标对 (i, j) 映射到夹角列表中的索引。
+
+    参数:
+        i, j: 目标索引 (1-indexed)，i < j
+        n_targets: 实际目标数
+
+    返回:
+        idx: 在 C(N,2) 夹角列表中的位置
+    """
+    # 使用组合数学: idx = sum_{k=1}^{i-1} (n_targets - k) + (j - i - 1)
+    idx = 0
+    for k in range(1, i):
+        idx += n_targets - k
+    idx += j - i - 1
+    return idx
+
+
+def _append_nearest_farthest_angle(step_arr: np.ndarray) -> np.ndarray:
+    """
+    计算该时间步最近与最远目标的夹角，追加到特征末尾。
+
+    步骤:
+      1. 从特征中提取距离和夹角
+      2. 找到最近目标（距离最小）和最远目标（距离最大）
+      3. 查找对应的夹角
+      4. 追加到特征数组末尾
+
+    特征结构: [N×6 states, N distances, C(N,2) angles]
+    """
+    total = len(step_arr)
+    # 解方程: N×6 + N + N×(N-1)/2 = total
+    # 对于 N=2: 12+2+1=15; N=3: 18+3+3=24; N=4: 24+4+6=34
+    n_targets = None
+    for n in [2, 3, 4]:
+        if n * 6 + n + n * (n - 1) // 2 == total:
+            n_targets = n
+            break
+    if n_targets is None:
+        raise ValueError(f"无法确定目标数: 特征长度={total}")
+
+    n_states = n_targets * 6
+    n_dists = n_targets
+    n_angles = n_targets * (n_targets - 1) // 2
+
+    dists = step_arr[n_states : n_states + n_dists]      # N 个距离
+    angles = step_arr[n_states + n_dists : total]         # C(N,2) 个夹角
+
+    if n_targets == 1:
+        # 不应出现，但兜底
+        nf_angle = np.float32(0)
+    else:
+        nearest_idx = int(np.argmin(dists)) + 1  # 1-indexed
+        farthest_idx = int(np.argmax(dists)) + 1
+        if nearest_idx == farthest_idx:
+            # 距离相等时取不同的目标
+            sorted_idx = np.argsort(dists)
+            nearest_idx = int(sorted_idx[0]) + 1
+            farthest_idx = int(sorted_idx[-1]) + 1
+        if nearest_idx > farthest_idx:
+            nearest_idx, farthest_idx = farthest_idx, nearest_idx
+        angle_idx = _get_pairwise_angle_index(nearest_idx, farthest_idx, n_targets)
+        nf_angle = angles[angle_idx]
+
+    return np.append(step_arr, nf_angle)
 
 
 def parse_y_csv(filepath: str, config: dict = None):
@@ -179,51 +249,48 @@ def compute_grouped_statistics(data: np.ndarray, max_targets: int):
     """
     按物理量分组计算均值和标准差（仅对非零元素）。
 
-    每步 34 个特征分三组：
-      - 状态 (0:24): 6 物理量 × 4 目标，统计按 6 物理量做，tile 至 24
-      - 距离 (24:28): 1 物理量，tile 至 4
-      - 夹角 (28:34): 1 物理量，tile 至 6
-
-    参数:
-        data: (num_samples, 10, 34)
+    每步 35 个特征分三组：
+      - 状态 (0:24): 6 物理量 × 4 目标
+      - 距离 (24:28): 4 距离值
+      - 夹角 (28:35): 6 两两夹角 + 1 最近最远夹角 (均为 rad 量级)
 
     返回:
-        mean, std: shape (34,) —— tile 后的均值/标准差
+        mean, std: shape (35,)
     """
-    D = data.shape[-1]  # 34
+    D = data.shape[-1]  # 35
     num_samples = data.shape[0]
 
-    # --- 状态部分：reshape 为 (N, 10, 4, 6)，按第 3 维(6)统计 ---
+    # --- 状态部分 ---
     states = data[:, :, :24].reshape(num_samples, -1, max_targets, 6)
     states_flat = states.reshape(-1, 6)
     state_mask = (states_flat != 0).any(axis=1)
     state_valid = states_flat[state_mask]
-    state_mean_6 = state_valid.mean(axis=0).astype(np.float32)  # (6,)
-    state_std_6 = state_valid.std(axis=0).astype(np.float32)     # (6,)
+    state_mean_6 = state_valid.mean(axis=0).astype(np.float32)
+    state_std_6 = state_valid.std(axis=0).astype(np.float32)
 
-    # --- 距离部分：reshape 为 (N, 10, 4)，按标量统计 ---
+    # --- 距离部分 ---
     dists = data[:, :, 24:28].reshape(-1, max_targets)
     dist_flat = dists.reshape(-1)
     dist_nonzero = dist_flat[dist_flat != 0]
     dist_mean = dist_nonzero.mean().astype(np.float32) if len(dist_nonzero) > 0 else np.float32(0)
     dist_std = dist_nonzero.std().astype(np.float32) if len(dist_nonzero) > 0 else np.float32(1)
 
-    # --- 夹角部分：reshape 为 (N, 10, 6)，按标量统计 ---
-    angles = data[:, :, 28:34].reshape(-1, 6)
+    # --- 夹角部分 (28:35，含最近最远夹角) ---
+    angles = data[:, :, 28:35].reshape(-1, 7)
     angle_flat = angles.reshape(-1)
     angle_nonzero = angle_flat[angle_flat != 0]
     angle_mean = angle_nonzero.mean().astype(np.float32) if len(angle_nonzero) > 0 else np.float32(0)
     angle_std = angle_nonzero.std().astype(np.float32) if len(angle_nonzero) > 0 else np.float32(1)
 
-    # --- 组装为 (34,) ---
+    # --- 组装 ---
     mean = np.zeros(D, dtype=np.float32)
     std = np.zeros(D, dtype=np.float32)
     mean[:24] = np.tile(state_mean_6, max_targets)
     std[:24] = np.tile(state_std_6, max_targets)
     mean[24:28] = dist_mean
     std[24:28] = dist_std
-    mean[28:34] = angle_mean
-    std[28:34] = angle_std
+    mean[28:35] = angle_mean
+    std[28:35] = angle_std
     return mean, std
 
 

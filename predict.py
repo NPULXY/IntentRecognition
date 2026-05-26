@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from utils.data_loader import (
     parse_csv_to_tensor, parse_nested_list_string,
-    pad_step, normalize_position,
+    pad_step, normalize_position, _append_nearest_farthest_angle,
 )
 from models.conv_transformer import Conv2DTransformer
 
@@ -71,7 +71,9 @@ def preprocess_sample(raw_real, raw_rec, config, stats):
         time_steps_mask = []
         max_len = config["data"]["max_step_features"]
         for step in raw:
-            padded = pad_step(np.array(step, dtype=np.float32), max_len)
+            step_arr = np.array(step, dtype=np.float32)
+            step_with_nf = _append_nearest_farthest_angle(step_arr)
+            padded = pad_step(step_with_nf, max_len)
             mask_vals = padded != 0
             padded = padded.copy()
             padded = (padded - mean_arr) / (std_arr + 1e-8)
