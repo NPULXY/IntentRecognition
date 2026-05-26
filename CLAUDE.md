@@ -6,7 +6,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 航天器相对运动交会/博弈的**意图识别**深度学习项目。输入追踪航天器的真实轨迹 (`X_real`) 和 CW 方程递推预测轨迹 (`X_recurrence`)，输出三个标签：目标数量 N（分类）、全局最小距离 min_distance（回归）、最近与最远目标夹角 phi（回归）。
 
-数据规模 23,787 样本，N 分布为 2(46%)/3(31%)/4(23%)。每个样本 10 个时间步，每步包含 N×6 维状态 (x,y,z,vx,vy,vz)。N 可变导致输入变长。
+数据规模 23,787 样本，N 分布为 2(46%)/3(31%)/4(23%)。每个样本 10 个时间步，N 可变导致输入变长。
+
+## 数据集
+
+当前 `Dataset/` 使用**增强版数据集**，每步包含：
+
+| N | 状态数 (x,y,z,vx,vy,vz) | 距离数 (到原点) | 夹角数 (两两) | 单步总特征 |
+|:-:|:---:|:---:|:---:|:---:|
+| 2 | 12 | 2 | 1 | 15 |
+| 3 | 18 | 3 | 3 | 24 |
+| 4 | 24 | 4 | 6 | **34** |
+
+距离和夹角是确定性几何量，从状态值派生。原版数据集（仅 N×6 状态，无几何特征）在 `Dataset.zip` 中。
 
 ## 常用命令
 
@@ -24,32 +36,38 @@ python predict.py --raw-real "<nested_list>" --raw-rec "<nested_list>"  # 单样
 ### 数据流
 
 ```
-CSV (嵌套列表字符串) → ast.literal_eval 逐行解析 → pad 至 max_N=4 → 按 6 特征维分别 z-score
-→ IntentRecognitionDataset → 同步随机划分 (70/15/15, seed=42) → DataLoader
+CSV (嵌套列表字符串) → ast.literal_eval 逐行解析 → pad_step 至 34
+→ 分组 z-score (状态/距离/夹角各自归一化) → IntentRecognitionDataset
+→ 同步随机划分 (70/15/15, seed=42) → DataLoader
 ```
 
 CSV 每行是**单列嵌套列表字符串**，逗号在内层列表中，因此**不能用 `pd.read_csv` 默认逗号分隔**，必须逐行 `ast.literal_eval` 解析。三个 CSV 行序严格对应，划分时使用同一 `random_state` 和同一索引数组。
 
 ### 标准化策略
 
-**按特征维度分别 z-score**（非全局标量）。reshape 为 `(N, 10, 4, 6)`，在最后一维（6 个物理量：x,y,z,vx,vy,vz）上分别计算均值/标准差（仅对非零位置），然后 tile 回 24 维。这样位置 (km 量级) 和速度 (km/s 量级) 各自被正确归一化。**零填充位置在标准化后强制恢复为 0**，使模型能通过零值识别 padding。
+**分组标准化**（`compute_grouped_statistics`）：34 个特征分三组：
+- **状态 (0:24)**：6 物理量 × 4 目标，按 6 物理量分别统计后 tile
+- **距离 (24:28)**：同物理量（km），全局统计后 tile
+- **夹角 (28:34)**：同物理量（rad），全局统计后 tile
+
+零填充位置标准化后强制恢复为 0，使模型能识别 padding。
 
 ### 模型: Conv2D + Transformer v4 (`models/conv_transformer.py`)
 
 核心改进：**N 分类使用独立的早分支**（从 Conv 特征直接经轻量 MLP 预测），避免回归任务的梯度干扰 N 分类学习。
 
 ```
-X_real (B,10,24) + X_recurrence (B,10,24)
-  → cat → (B,10,48) → unsqueeze → (B,1,10,48)
-  → 3×ConvBlock(1→32→64→128) → (B,128,10,48)
-  → MaxPool2d((1,2)) → (B,128,10,24)              # 仅特征维池化，保持时间维
-  → ──┬─ [N早分支] AdaptiveAvgPool2d → Flatten → Linear(128,64) → Linear(64,3)  # N 分类
+X_real (B,10,34) + X_recurrence (B,10,34)
+  → cat → (B,10,68) → unsqueeze → (B,1,10,68)
+  → 4×ConvBlock(1→48→96→192→256) → (B,256,10,68)
+  → MaxPool2d((1,2)) → (B,256,10,34)
+  → ──┬─ [N早分支] AdaptiveAvgPool2d → Flatten → Linear(256,128) → Linear(128,3)
        │
-       └─ [回归分支] reshape → (B,10,3072) → Linear → (B,10,256)
+       └─ [回归分支] reshape → (B,10,8704) → Linear → (B,10,256)
            → PositionalEncoding → 3×TransformerEncoder(d=256, h=8)
            → mean(dim=1) → (B,256) → shared_fc → (B,256)
-           → ├─ dist_head: Linear(256,128)→ReLU→Linear(128,1)           # min_distance
-              └─ phi_head:  Linear(256,128)→ReLU→Linear(128,2)           # (cosφ, sinφ)
+           → ├─ dist_head: Linear(256,128)→ReLU→Linear(128,1)         # min_distance
+              └─ phi_head:  Linear(256,128)→ReLU→Linear(128,2)         # (cosφ, sinφ)
 ```
 
 关键设计：
@@ -61,28 +79,42 @@ X_real (B,10,24) + X_recurrence (B,10,24)
 
 ### checkpoint 内容
 
-`best_model.pt` 包含 `model_state_dict`、`stats`（标准化参数）、`config` 和标签变换参数 `label_transform`，确保 evaluate/predict 可独立运行，无需重新计算统计量。
+`best_model.pt` 包含 `model_state_dict`、`stats`（标准化参数，含分组统计量）、`config` 和 `label_transform`，确保 evaluate/predict 可独立运行。
 
-## 实验结果
+## 实验结果（最佳：v4 + 原版数据）
 
 | 任务 | 指标 | 值 |
 |------|------|-----|
-| N 分类 | 准确率 | 100%（零填充直接暴露目标数）|
-| min_distance | MAE / R² | 0.63 km / 0.42（比猜均值好 26%）|
+| N 分类 | 准确率 | 100% |
+| min_distance | MAE / R² | 0.63 km / 0.42 |
 | phi | MAE / R² | 0.55 rad / ~0（完全未学到）|
 
 ## 已知问题与改进方向
 
 - **N 分类已解决**：v4 早分支架构保证训练全程 100%。
-- **min_distance R²≈0.42**：中等水平。可尝试按 N 分组训练子模型、增大 Transformer 容量、或显式计算几何特征。
-- **phi R²≈0 是本任务核心瓶颈**。phi 是"最近与最远目标位置向量夹角"——这是高阶几何量，需先定位最近/最远目标再计算角度，Conv2D 的局部特征不足以完成此推理链。最有效的改进方向是**显式几何特征工程**：在输入端直接计算每时间步各目标间距离和角度，作为额外特征通道送入模型，而非期望网络从 x/y/z 坐标中隐式学习几何关系。
+- **min_distance R²≈0.42**：中等水平，比猜均值好 26%。仍有提升空间。
+- **phi R²≈0 是本任务核心瓶颈**。phi = "全局最小距离时刻，最近与最远目标位置向量夹角"。这需要：
+  1. 找到全局最小距离对应的时刻 → argmin
+  2. 在该时刻找到最近/最远目标 → argmin/argmax
+  3. 查找对应夹角 → lookup
+
+  这些都是离散选择操作，神经网络天生不擅长。显式嵌入每步距离和两两夹角（增强数据集）**没有改善** phi，因为数据虽有但模型无法学会"选择"。`phi-improvement` 分支尝试预计算每步候选 phi 也无效——仍需选对时间步。
+
+  突破方向可能需要**两阶段模型**（先预测 min_distance 时间位置，再查找 phi）或**软注意力机制**替代硬 argmin/argmax。
 
 ## 实验历史
 
-| 版本 | 方案 | 结果 |
-|------|------|------|
-| v1 | 2.6M 参数，Huber 损失，单头共享 | N=100%, dist R²=0.41, phi R²≈0，N 在 epoch 8 崩塌 |
-| v2 | 16.8M 参数 + log-dist + cos/sin phi | 完全崩溃，N 始终 45% |
-| v2b | 6.6M 参数 + log-dist + cos/sin phi | N=100%, dist R²=0.005（log 反而恶化）|
-| v3 | v1 架构 + cos/sin phi | N 在 epoch 18 崩塌，与 v1 同模式 |
-| v4 | v1 大小 + N 早分支 + cos/sin phi | **最佳**：N 不崩塌，dist R²=0.42，phi 仍未学到 |
+| 版本 | 数据 | 架构 | N | dist R² | phi R² | 备注 |
+|------|------|------|:--:|:-------:|:------:|------|
+| v1 | 原版 | 2.6M, 单头共享 | 100% | 0.41 | ~0 | N 在 epoch 8 崩塌 |
+| v2 | 原版 | 16.8M + log-dist + cos/sin | 45% | — | — | 完全崩溃 |
+| v2b | 原版 | 6.6M + log-dist + cos/sin | 100% | 0.005 | ~0 | log 反而恶化 |
+| v3 | 原版 | v1 + cos/sin phi | 100% | — | ~0 | N 在 epoch 18 崩塌 |
+| **v4** | **原版** | **N 早分支 + cos/sin phi** | **100%** | **0.42** | **~0** | **最佳** |
+| — | 增强版 | v4 + 更大 Conv | 100% | 0.41 | ~0 | 几何特征未提升 |
+| — | 增强版 | + 候选 phi 特征 | 100% | ~0 | ~0 | phi-improvement 分支 |
+
+## 分支
+
+- `master`：当前主分支，适配增强版数据集（34 特征），v4 架构
+- `phi-improvement`：预计算每步最近最远夹角作为第 35 维特征的实验（失败）
