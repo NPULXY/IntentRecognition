@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from utils.data_loader import (
     parse_csv_to_tensor, parse_nested_list_string,
-    pad_targets, normalize_per_feature,
+    pad_step, normalize_position,
 )
 from models.conv_transformer import Conv2DTransformer
 
@@ -49,42 +49,35 @@ def load_model(config: dict, device: torch.device):
     return model, stats
 
 
-def preprocess_sample(raw_real, raw_rec, max_targets, feature_dim, stats):
+def preprocess_sample(raw_real, raw_rec, config, stats):
     """
     将原始嵌套列表数据预处理为模型输入张量。
 
     参数:
-        raw_real: 长度为 10 的列表，每个元素是长度为 N*6 的列表
+        raw_real: 长度为 10 的列表，每个元素含 N×6+N+C(N,2) 个浮点数
         raw_rec: 同上
-        max_targets: 最大目标数
-        feature_dim: 每个目标的特征维度
+        config: 全局配置
         stats: 标准化统计量字典
 
     返回:
-        x_real: (1, 10, max_N*6) torch.Tensor
-        x_recurrence: (1, 10, max_N*6) torch.Tensor
-        mask: (1, 10, max_N) torch.Tensor
+        x_real: (1, 10, max_step_features) torch.Tensor
+        x_recurrence: (1, 10, max_step_features) torch.Tensor
+        mask: (1, 10, max_step_features) torch.Tensor
     """
     def process_one(raw, mean, std):
         mean_arr = np.array(mean).reshape(1, -1)
         std_arr = np.array(std).reshape(1, -1)
         time_steps_data = []
         time_steps_mask = []
+        max_len = config["data"]["max_step_features"]
         for step in raw:
-            n_targets = len(step) // feature_dim
-            padded = pad_targets(
-                np.array(step, dtype=np.float32), max_targets, feature_dim
-            )
-            # 按特征维度标准化
+            padded = pad_step(np.array(step, dtype=np.float32), max_len)
             mask_vals = padded != 0
             padded = padded.copy()
             padded = (padded - mean_arr) / (std_arr + 1e-8)
             padded[~mask_vals] = 0.0
             time_steps_data.append(padded)
-
-            m = np.zeros(max_targets, dtype=np.float32)
-            m[:n_targets] = 1.0
-            time_steps_mask.append(m)
+            time_steps_mask.append(mask_vals.astype(np.float32))
 
         return (np.stack(time_steps_data, axis=0),
                 np.stack(time_steps_mask, axis=0))
@@ -136,23 +129,22 @@ def predict_single(model, x_real, x_rec, mask, device, stats=None):
 
 def predict_batch(model, real_csv_path, rec_csv_path, config, stats, device):
     """从 CSV 文件批量推理，输出物理空间预测值。"""
-    max_targets = config["data"]["max_targets"]
-    feature_dim = config["data"]["feature_dim"]
+    max_step_features = config["data"]["max_step_features"]
 
     print(f"[数据加载] 解析 {real_csv_path} ...")
-    real_data, _ = parse_csv_to_tensor(real_csv_path, max_targets, feature_dim)
-    rec_data, _ = parse_csv_to_tensor(rec_csv_path, max_targets, feature_dim)
+    real_data, _ = parse_csv_to_tensor(real_csv_path, max_step_features)
+    rec_data, _ = parse_csv_to_tensor(rec_csv_path, max_step_features)
 
-    real_data = normalize_per_feature(real_data,
-                                         np.array(stats["real_mean"]),
-                                         np.array(stats["real_std"]))
-    rec_data = normalize_per_feature(rec_data,
-                                      np.array(stats["rec_mean"]),
-                                      np.array(stats["rec_std"]))
+    real_data = normalize_position(real_data,
+                                   np.array(stats["real_mean"]),
+                                   np.array(stats["real_std"]))
+    rec_data = normalize_position(rec_data,
+                                   np.array(stats["rec_mean"]),
+                                   np.array(stats["rec_std"]))
 
     x_real = torch.from_numpy(real_data).float()
     x_rec = torch.from_numpy(rec_data).float()
-    mask = torch.zeros(x_real.size(0), config["data"]["time_steps"], max_targets)
+    mask = torch.zeros(x_real.size(0), config["data"]["time_steps"], max_step_features)
 
     batch_size = config["training"]["batch_size"]
     n_preds, dist_preds, phi_preds = [], [], []
@@ -208,10 +200,7 @@ def main():
         raw_rec = parse_nested_list_string(args.raw_rec)
 
         x_real, x_rec, mask = preprocess_sample(
-            raw_real, raw_rec,
-            config["data"]["max_targets"],
-            config["data"]["feature_dim"],
-            stats,
+            raw_real, raw_rec, config, stats
         )
         result = predict_single(model, x_real, x_rec, mask, device, stats)
         print(f"\n预测结果:")

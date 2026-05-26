@@ -11,7 +11,8 @@ data:
   y_file: "Y.csv"
   max_targets: 4
   time_steps: 10
-  feature_dim: 6
+  feature_dim: 6            # 每个目标的状态维度 (x,y,z,vx,vy,vz)
+  max_step_features: 34     # N=4 时单步总特征: 24状态 + 4距离 + 6夹角 = 34
 
 # 数据集划分
 split:
@@ -27,7 +28,7 @@ label_transform:
 
 # 模型 (与 v1 相近，仅 phi 头输出 2 通道)
 model:
-  conv_channels: [32, 64, 128]
+  conv_channels: [48, 96, 192, 256]
   conv_kernel: 3
   conv_padding: 1
   pool_kernel: 2

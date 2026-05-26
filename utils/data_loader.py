@@ -20,40 +20,38 @@ def parse_nested_list_string(s: str):
     return ast.literal_eval(s)
 
 
-def pad_targets(sample: np.ndarray, max_targets: int, feature_dim: int) -> np.ndarray:
+def pad_step(sample: np.ndarray, max_len: int) -> np.ndarray:
     """
-    将单个时间步的特征填充至 (max_targets * feature_dim) 长度。
+    将单个时间步的特征填充至固定长度。
 
     参数:
-        sample: shape (N * feature_dim,) 的一维数组，N 为实际目标数
-        max_targets: 最大目标数
-        feature_dim: 每个目标的特征维度
+        sample: 一维数组，长度因 N 而异 (N=2→15, N=3→24, N=4→34)
+        max_len: 目标长度 (34)
 
     返回:
-        shape (max_targets * feature_dim,) 的填充后数组
+        shape (max_len,) 的填充后数组
     """
     actual_len = len(sample)
-    if actual_len < max_targets * feature_dim:
-        padded = np.zeros(max_targets * feature_dim, dtype=np.float32)
+    if actual_len < max_len:
+        padded = np.zeros(max_len, dtype=np.float32)
         padded[:actual_len] = sample
         return padded
     return sample.astype(np.float32)
 
 
-def parse_csv_to_tensor(filepath: str, max_targets: int, feature_dim: int):
+def parse_csv_to_tensor(filepath: str, max_step_features: int):
     """
-    解析单个 CSV 文件为三维张量 (样本数, 时间步, max_targets * feature_dim)。
+    解析单个 CSV 文件为三维张量 (样本数, 时间步, max_step_features)。
 
-    CSV 每行为一个嵌套列表字符串，内部逗号不能作为列分隔符，
-    因此逐行读取并用 ast.literal_eval 解析。
+    新数据集每步包含: N×6 状态 + N 距离 + C(N,2) 夹角。
+    N=2→15, N=3→24, N=4→34。pad 至 34。
 
     参数:
         filepath: CSV 文件路径
-        max_targets: 最大目标数
-        feature_dim: 每个目标的特征维度
+        max_step_features: 单步最大特征数 (34)
 
     返回:
-        numpy 数组, shape (num_samples, 10, max_targets * feature_dim)
+        numpy 数组, shape (num_samples, 10, max_step_features)
     """
     samples = []
     masks = []
@@ -69,19 +67,18 @@ def parse_csv_to_tensor(filepath: str, max_targets: int, feature_dim: int):
             time_steps_mask = []
 
             for step in raw:
-                n_targets = len(step) // feature_dim
-                padded = pad_targets(np.array(step, dtype=np.float32), max_targets, feature_dim)
+                padded = pad_step(np.array(step, dtype=np.float32), max_step_features)
                 time_steps_data.append(padded)
 
-                m = np.zeros(max_targets, dtype=np.float32)
-                m[:n_targets] = 1.0
+                # 构建有效性掩码（非零位置为真实特征）
+                m = (padded != 0).astype(np.float32)
                 time_steps_mask.append(m)
 
-            samples.append(np.stack(time_steps_data, axis=0))   # (10, max_N * 6)
-            masks.append(np.stack(time_steps_mask, axis=0))      # (10, max_N)
+            samples.append(np.stack(time_steps_data, axis=0))   # (10, max_step_features)
+            masks.append(np.stack(time_steps_mask, axis=0))      # (10, max_step_features)
 
-    data = np.stack(samples, axis=0)  # (num_samples, 10, max_N * 6)
-    masks = np.stack(masks, axis=0)   # (num_samples, 10, max_N)
+    data = np.stack(samples, axis=0)  # (num_samples, 10, max_step_features)
+    masks = np.stack(masks, axis=0)   # (num_samples, 10, max_step_features)
     return data, masks
 
 
@@ -178,48 +175,66 @@ class IntentRecognitionDataset(Dataset):
         }
 
 
-def compute_per_feature_statistics(data: np.ndarray, max_targets: int, feature_dim: int):
+def compute_grouped_statistics(data: np.ndarray, max_targets: int):
     """
-    按特征维度分别计算均值和标准差（仅对非零元素）。
+    按物理量分组计算均值和标准差（仅对非零元素）。
 
-    将数据 reshape 为 (N, 10, max_targets, feature_dim)，然后对每个
-    特征维度（共 6 个：x,y,z,vx,vy,vz）独立计算统计量。
-    忽略填充目标的零值。
+    每步 34 个特征分三组：
+      - 状态 (0:24): 6 物理量 × 4 目标，统计按 6 物理量做，tile 至 24
+      - 距离 (24:28): 1 物理量，tile 至 4
+      - 夹角 (28:34): 1 物理量，tile 至 6
 
     参数:
-        data: (num_samples, time_steps, max_targets * feature_dim)
-        max_targets: 最大目标数
-        feature_dim: 每个目标的特征维度
+        data: (num_samples, 10, 34)
 
     返回:
-        mean: shape (max_targets * feature_dim,) —— 每特征维度的均值
-        std:  shape (max_targets * feature_dim,) —— 每特征维度的标准差
+        mean, std: shape (34,) —— tile 后的均值/标准差
     """
+    D = data.shape[-1]  # 34
     num_samples = data.shape[0]
-    # reshape: (N, 10, max_N*6) → (N, 10, max_N, 6)
-    reshaped = data.reshape(num_samples, -1, max_targets, feature_dim)
-    # → (N*10*max_N, 6)，独立计算每个特征维度的统计量
-    flat = reshaped.reshape(-1, feature_dim)
-    mask = (flat != 0).any(axis=1)  # 非全零行（真实目标）
-    valid = flat[mask]
 
-    mean = valid.mean(axis=0)  # (6,)
-    std = valid.std(axis=0)    # (6,)
+    # --- 状态部分：reshape 为 (N, 10, 4, 6)，按第 3 维(6)统计 ---
+    states = data[:, :, :24].reshape(num_samples, -1, max_targets, 6)
+    states_flat = states.reshape(-1, 6)
+    state_mask = (states_flat != 0).any(axis=1)
+    state_valid = states_flat[state_mask]
+    state_mean_6 = state_valid.mean(axis=0).astype(np.float32)  # (6,)
+    state_std_6 = state_valid.std(axis=0).astype(np.float32)     # (6,)
 
-    # 扩展回 (max_targets * feature_dim,) 方便 broadcast
-    mean_full = np.tile(mean, max_targets)  # (24,)
-    std_full = np.tile(std, max_targets)    # (24,)
-    return mean_full.astype(np.float32), std_full.astype(np.float32)
+    # --- 距离部分：reshape 为 (N, 10, 4)，按标量统计 ---
+    dists = data[:, :, 24:28].reshape(-1, max_targets)
+    dist_flat = dists.reshape(-1)
+    dist_nonzero = dist_flat[dist_flat != 0]
+    dist_mean = dist_nonzero.mean().astype(np.float32) if len(dist_nonzero) > 0 else np.float32(0)
+    dist_std = dist_nonzero.std().astype(np.float32) if len(dist_nonzero) > 0 else np.float32(1)
+
+    # --- 夹角部分：reshape 为 (N, 10, 6)，按标量统计 ---
+    angles = data[:, :, 28:34].reshape(-1, 6)
+    angle_flat = angles.reshape(-1)
+    angle_nonzero = angle_flat[angle_flat != 0]
+    angle_mean = angle_nonzero.mean().astype(np.float32) if len(angle_nonzero) > 0 else np.float32(0)
+    angle_std = angle_nonzero.std().astype(np.float32) if len(angle_nonzero) > 0 else np.float32(1)
+
+    # --- 组装为 (34,) ---
+    mean = np.zeros(D, dtype=np.float32)
+    std = np.zeros(D, dtype=np.float32)
+    mean[:24] = np.tile(state_mean_6, max_targets)
+    std[:24] = np.tile(state_std_6, max_targets)
+    mean[24:28] = dist_mean
+    std[24:28] = dist_std
+    mean[28:34] = angle_mean
+    std[28:34] = angle_std
+    return mean, std
 
 
-def normalize_per_feature(data: np.ndarray, mean: np.ndarray, std: np.ndarray):
-    """按特征维度 z-score 标准化。零填充位置保持为零。"""
+def normalize_position(data: np.ndarray, mean: np.ndarray, std: np.ndarray):
+    """按组标准化。零填充位置保持为零。"""
     data = data.copy()
     mask = data != 0
     mean = mean.reshape(1, 1, -1).astype(data.dtype)
     std = std.reshape(1, 1, -1).astype(data.dtype)
     data = (data - mean) / (std + 1e-8)
-    data[~mask] = 0.0  # 恢复零填充
+    data[~mask] = 0.0
     return data
 
 
@@ -233,8 +248,7 @@ def load_and_preprocess(data_dir: str, config: dict):
         stats: 统计量字典
     """
     cfg_data = config["data"]
-    max_targets = cfg_data["max_targets"]
-    feature_dim = cfg_data["feature_dim"]
+    max_step_features = cfg_data["max_step_features"]
 
     import os
 
@@ -244,11 +258,11 @@ def load_and_preprocess(data_dir: str, config: dict):
     y_path = os.path.join(data_dir, cfg_data["y_file"])
 
     print(f"[数据加载] 解析 {real_path} ...")
-    X_real, masks_real = parse_csv_to_tensor(real_path, max_targets, feature_dim)
+    X_real, masks_real = parse_csv_to_tensor(real_path, max_step_features)
     print(f"  X_real 形状: {X_real.shape}")
 
     print(f"[数据加载] 解析 {rec_path} ...")
-    X_recurrence, masks_rec = parse_csv_to_tensor(rec_path, max_targets, feature_dim)
+    X_recurrence, masks_rec = parse_csv_to_tensor(rec_path, max_step_features)
     print(f"  X_recurrence 形状: {X_recurrence.shape}")
 
     print(f"[数据加载] 解析 {y_path} ...")
@@ -259,19 +273,19 @@ def load_and_preprocess(data_dir: str, config: dict):
     if config.get("label_transform", {}).get("phi_cos_sin", False):
         print(f"  [变换] phi → (cosφ, sinφ) 双通道")
 
-    # 掩码取交集（两个输入的掩码应当一致）
-    masks = masks_real  # masks_real == masks_rec
+    # 掩码
+    masks = masks_real
 
-    # 按特征维度标准化（位置和速度分别处理，避免量级差异）
-    real_mean, real_std = compute_per_feature_statistics(X_real, max_targets, feature_dim)
-    rec_mean, rec_std = compute_per_feature_statistics(X_recurrence, max_targets, feature_dim)
-    print(f"\n[标准化] X_real 各特征均值: {real_mean[:6]}")
-    print(f"[标准化] X_real 各特征标准差: {real_std[:6]}")
-    print(f"[标准化] X_recurrence 各特征均值: {rec_mean[:6]}")
-    print(f"[标准化] X_recurrence 各特征标准差: {rec_std[:6]}")
+    # 按特征位置分别标准化（34 个位置各含不同物理量，量级差异大）
+    real_mean, real_std = compute_grouped_statistics(X_real, cfg_data["max_targets"])
+    rec_mean, rec_std = compute_grouped_statistics(X_recurrence, cfg_data["max_targets"])
+    print(f"\n[标准化] X_real 前6位置均值(状态): {real_mean[:6]}")
+    print(f"[标准化] X_real 距离位置均值: {real_mean[24:28]}")
+    print(f"[标准化] X_real 夹角位置均值: {real_mean[28:]}")
+    print(f"[标准化] X_real 夹角位置标准差: {real_std[28:]}")
 
-    X_real = normalize_per_feature(X_real, real_mean, real_std)
-    X_recurrence = normalize_per_feature(X_recurrence, rec_mean, rec_std)
+    X_real = normalize_position(X_real, real_mean, real_std)
+    X_recurrence = normalize_position(X_recurrence, rec_mean, rec_std)
 
     # 标签统计
     print(f"\n[标签统计]")

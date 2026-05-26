@@ -75,9 +75,8 @@ class Conv2DTransformer(nn.Module):
         cfg = config["model"]
         cfg_data = config["data"]
 
-        max_targets = cfg_data["max_targets"]
-        feature_dim = cfg_data["feature_dim"]
-        self.input_width = max_targets * feature_dim * 2
+        max_step_features = cfg_data["max_step_features"]
+        self.input_width = max_step_features * 2    # real + recurrence
 
         conv_channels = cfg["conv_channels"]
         conv_kernel = cfg["conv_kernel"]
